@@ -1,0 +1,12 @@
+[package]
+name = "cert-storage-inspector"
+version = "0.1.0"
+authors = ["Dana Keeler <mozkeeler@gmail.com>"]
+edition = "2018"
+
+[dependencies]
+base64 = "0.10"
+curl = "^0.4"
+lmdb-rkv = "0.11"
+rkv = "^0.9"
+serde_json = "1.0"
