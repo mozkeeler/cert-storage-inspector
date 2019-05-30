@@ -28,7 +28,7 @@ impl<T: Display> From<T> for SimpleError {
 }
 
 const DEFAULT_ONECRL_URL: &str = "https://firefox.settings.services.mozilla.com/v1/\
-                                  buckets/blocklists/collections/certificates/records";
+                                  buckets/security-state/collections/onecrl/records";
 
 fn main() {
     let yaml = load_yaml!("cli.yml");
