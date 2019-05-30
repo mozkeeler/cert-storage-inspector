@@ -1,15 +1,17 @@
 extern crate base64;
+#[macro_use]
+extern crate clap;
 extern crate curl;
 extern crate lmdb;
 extern crate rkv;
 extern crate serde_json;
 
+use clap::App;
 use curl::easy::Easy;
 use lmdb::EnvironmentFlags;
 use rkv::{Rkv, StoreOptions, Value};
 use serde_json::Value as JsonValue;
 use std::collections::BTreeSet;
-use std::env;
 use std::fmt::Display;
 use std::path::PathBuf;
 
@@ -26,14 +28,22 @@ impl<T: Display> From<T> for SimpleError {
 }
 
 fn main() {
-    if let Err(e) = do_it() {
+    let yaml = load_yaml!("cli.yml");
+    let matches = App::from_yaml(yaml).get_matches();
+    let onecrl_url = matches.value_of("onecrl-url").unwrap_or("https://firefox.settings.services.mozilla.com/v1/buckets/blocklists/collections/certificates/records");
+    let profile_path = matches
+        .value_of("profile-path")
+        .expect("need path to Firefox profile");
+    if let Err(e) = do_it(onecrl_url, profile_path) {
         eprintln!("{}", e.message);
     }
 }
 
-fn do_it() -> Result<(), SimpleError> {
-    let current_revocations = download_current_revocations()?;
-    let revocations_in_profile = read_profile_revocations()?;
+fn do_it(onecrl_url: &str, profile_path: &str) -> Result<(), SimpleError> {
+    let current_revocations = download_current_revocations(onecrl_url)?;
+    println!("current OneCRL revocations: {}", current_revocations.len());
+    let revocations_in_profile = read_profile_revocations(profile_path)?;
+    println!("revocations in profile: {}", revocations_in_profile.len());
     println!("revocations in OneCRL but not in profile:");
     for revocation in current_revocations.difference(&revocations_in_profile) {
         println!("{:?}", revocation);
@@ -45,14 +55,12 @@ fn do_it() -> Result<(), SimpleError> {
     Ok(())
 }
 
-fn read_profile_revocations() -> Result<BTreeSet<Revocation>, SimpleError> {
-    let db_path = env::args()
-        .nth(1)
-        .ok_or(SimpleError::from("expected path to cert_storage db"))?;
+fn read_profile_revocations(profile_path: &str) -> Result<BTreeSet<Revocation>, SimpleError> {
     let mut builder = Rkv::environment_builder();
     builder.set_max_dbs(2);
     builder.set_flags(EnvironmentFlags::READ_ONLY);
-    let db_path = PathBuf::from(db_path);
+    let mut db_path = PathBuf::from(profile_path);
+    db_path.push("security_state");
     let env = Rkv::from_env(&db_path, builder)?;
     let store = env.open_single("cert_storage", StoreOptions::default())?;
     let reader = env.read()?;
@@ -88,6 +96,13 @@ fn decode_item(key: &[u8], value: &Option<Value>, revocations: &mut BTreeSet<Rev
             &key[PREFIX_REV_IS.len()..],
             value,
             RevocationType::IssuerSerial,
+            revocations,
+        );
+    } else if has_prefix(key, PREFIX_REV_SPK) {
+        decode_revocation(
+            &key[PREFIX_REV_SPK.len()..],
+            value,
+            RevocationType::SubjectPublicKey,
             revocations,
         );
     }
@@ -172,9 +187,9 @@ struct Revocation {
     field2: String,
 }
 
-fn download_current_revocations() -> Result<BTreeSet<Revocation>, SimpleError> {
+fn download_current_revocations(onecrl_url: &str) -> Result<BTreeSet<Revocation>, SimpleError> {
     let mut easy = Easy::new();
-    easy.url("https://firefox.settings.services.mozilla.com/v1/buckets/blocklists/collections/certificates/records")?; // TODO: make configurable?
+    easy.url(onecrl_url)?;
     let mut data = Vec::new();
     {
         let mut transfer = easy.transfer();
@@ -235,7 +250,7 @@ fn download_current_revocations() -> Result<BTreeSet<Revocation>, SimpleError> {
                 .as_str()
                 .ok_or(SimpleError::from("pubKeyHash not a string"))?;
             if !revocations.insert(Revocation {
-                typ: RevocationType::IssuerSerial,
+                typ: RevocationType::SubjectPublicKey,
                 field1: subject.to_owned(),
                 field2: pub_key_hash.to_owned(),
             }) {
