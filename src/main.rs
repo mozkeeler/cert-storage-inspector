@@ -27,10 +27,13 @@ impl<T: Display> From<T> for SimpleError {
     }
 }
 
+const DEFAULT_ONECRL_URL: &str = "https://firefox.settings.services.mozilla.com/v1/\
+                                  buckets/blocklists/collections/certificates/records";
+
 fn main() {
     let yaml = load_yaml!("cli.yml");
     let matches = App::from_yaml(yaml).get_matches();
-    let onecrl_url = matches.value_of("onecrl-url").unwrap_or("https://firefox.settings.services.mozilla.com/v1/buckets/blocklists/collections/certificates/records");
+    let onecrl_url = matches.value_of("onecrl-url").unwrap_or(DEFAULT_ONECRL_URL);
     let profile_path = matches
         .value_of("profile-path")
         .expect("need path to Firefox profile");
@@ -168,12 +171,15 @@ fn decode_revocation(
     }
     match split_der_key(key) {
         Ok((part1, part2)) => {
-            if !revocations.insert(Revocation {
+            let revocation = Revocation {
                 typ,
                 field1: base64::encode(part1),
                 field2: base64::encode(part2),
-            }) {
-                eprintln!("duplicate entry in profile?");
+            };
+            if revocations.contains(&revocation) {
+                eprintln!("duplicate entry in profile? ({:?})", revocation);
+            } else {
+                revocations.insert(revocation);
             }
         }
         Err(e) => eprintln!("error decoding key: {}", e.message),
@@ -214,7 +220,7 @@ fn download_current_revocations(onecrl_url: &str) -> Result<BTreeSet<Revocation>
         let entry = entry
             .as_object()
             .ok_or(SimpleError::from("unexpected type"))?;
-        if entry.contains_key("issuerName") && entry.contains_key("serialNumber") {
+        let revocation = if entry.contains_key("issuerName") && entry.contains_key("serialNumber") {
             let issuer = entry
                 .get("issuerName")
                 .ok_or(SimpleError::from("couldn't get issuerName"))?;
@@ -227,12 +233,10 @@ fn download_current_revocations(onecrl_url: &str) -> Result<BTreeSet<Revocation>
             let serial = serial
                 .as_str()
                 .ok_or(SimpleError::from("serialNumber not a string"))?;
-            if !revocations.insert(Revocation {
+            Revocation {
                 typ: RevocationType::IssuerSerial,
                 field1: issuer.to_owned(),
                 field2: serial.to_owned(),
-            }) {
-                eprintln!("duplicate entry in OneCRL?");
             }
         } else if entry.contains_key("subject") && entry.contains_key("pubKeyHash") {
             // TODO: I'm not actually sure about these field names, because there aren't any
@@ -249,15 +253,19 @@ fn download_current_revocations(onecrl_url: &str) -> Result<BTreeSet<Revocation>
             let pub_key_hash = pub_key_hash
                 .as_str()
                 .ok_or(SimpleError::from("pubKeyHash not a string"))?;
-            if !revocations.insert(Revocation {
+            Revocation {
                 typ: RevocationType::SubjectPublicKey,
                 field1: subject.to_owned(),
                 field2: pub_key_hash.to_owned(),
-            }) {
-                eprintln!("duplicate entry?");
             }
         } else {
             eprintln!("entry with no issuer/serial or no subject/pubKeyHash");
+            continue;
+        };
+        if revocations.contains(&revocation) {
+            eprintln!("duplicate entry in OneCRL? ({:?})", revocation);
+        } else {
+            revocations.insert(revocation);
         }
     }
     Ok(revocations)
