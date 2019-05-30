@@ -32,8 +32,20 @@ fn main() {
 }
 
 fn do_it() -> Result<(), SimpleError> {
-    download_current_revocations()?;
-    /*
+    let current_revocations = download_current_revocations()?;
+    let revocations_in_profile = read_profile_revocations()?;
+    println!("revocations in OneCRL but not in profile:");
+    for revocation in current_revocations.difference(&revocations_in_profile) {
+        println!("{:?}", revocation);
+    }
+    println!("revocations in profile but not in OneCRL:");
+    for revocation in revocations_in_profile.difference(&current_revocations) {
+        println!("{:?}", revocation);
+    }
+    Ok(())
+}
+
+fn read_profile_revocations() -> Result<BTreeSet<Revocation>, SimpleError> {
     let db_path = env::args()
         .nth(1)
         .ok_or(SimpleError::from("expected path to cert_storage db"))?;
@@ -45,13 +57,13 @@ fn do_it() -> Result<(), SimpleError> {
     let store = env.open_single("cert_storage", StoreOptions::default())?;
     let reader = env.read()?;
     let iter = store.iter_start(&reader)?;
+    let mut revocations: BTreeSet<Revocation> = BTreeSet::new();
     for item in iter {
         if let Ok((key, value)) = item {
-            decode_item(key, &value);
+            decode_item(key, &value, &mut revocations);
         }
     }
-    */
-    Ok(())
+    Ok(revocations)
 }
 
 #[derive(Ord, Eq, PartialOrd, PartialEq, Debug)]
@@ -62,11 +74,6 @@ enum RevocationType {
 
 const PREFIX_REV_IS: &[u8] = b"is";
 const PREFIX_REV_SPK: &[u8] = b"spk";
-/*
-const PREFIX_SUBJECT: &[u8] = b"subject";
-const PREFIX_CERT: &[u8] = b"cert";
-const PREFIX_DATA_TYPE: &[u8] = b"datatype";
-*/
 
 fn has_prefix(data: &[u8], prefix: &[u8]) -> bool {
     if data.len() >= prefix.len() {
@@ -75,12 +82,13 @@ fn has_prefix(data: &[u8], prefix: &[u8]) -> bool {
     false
 }
 
-fn decode_item(key: &[u8], value: &Option<Value>) {
+fn decode_item(key: &[u8], value: &Option<Value>, revocations: &mut BTreeSet<Revocation>) {
     if has_prefix(key, PREFIX_REV_IS) {
         decode_revocation(
             &key[PREFIX_REV_IS.len()..],
             value,
             RevocationType::IssuerSerial,
+            revocations,
         );
     }
 }
@@ -128,7 +136,12 @@ fn split_der_key(key: &[u8]) -> Result<(&[u8], &[u8]), SimpleError> {
     Err(SimpleError::from("key too long"))
 }
 
-fn decode_revocation(key: &[u8], value: &Option<Value>, typ: RevocationType) {
+fn decode_revocation(
+    key: &[u8],
+    value: &Option<Value>,
+    typ: RevocationType,
+    revocations: &mut BTreeSet<Revocation>,
+) {
     match value {
         &Some(Value::I64(i)) if i == 1 => {}
         &Some(Value::I64(i)) if i == 0 => return,
@@ -140,17 +153,13 @@ fn decode_revocation(key: &[u8], value: &Option<Value>, typ: RevocationType) {
     }
     match split_der_key(key) {
         Ok((part1, part2)) => {
-            let (prefix1, prefix2) = match typ {
-                RevocationType::IssuerSerial => ("issuer", "serial"),
-                RevocationType::SubjectPublicKey => ("subject", "spki"),
-            };
-            println!(
-                "{}:{} {}:{}",
-                prefix1,
-                base64::encode(part1),
-                prefix2,
-                base64::encode(part2)
-            );
+            if !revocations.insert(Revocation {
+                typ,
+                field1: base64::encode(part1),
+                field2: base64::encode(part2),
+            }) {
+                eprintln!("duplicate entry in profile?");
+            }
         }
         Err(e) => eprintln!("error decoding key: {}", e.message),
     }
@@ -163,7 +172,7 @@ struct Revocation {
     field2: String,
 }
 
-fn download_current_revocations() -> Result<(), SimpleError> {
+fn download_current_revocations() -> Result<BTreeSet<Revocation>, SimpleError> {
     let mut easy = Easy::new();
     easy.url("https://firefox.settings.services.mozilla.com/v1/buckets/blocklists/collections/certificates/records")?; // TODO: make configurable?
     let mut data = Vec::new();
@@ -203,12 +212,12 @@ fn download_current_revocations() -> Result<(), SimpleError> {
             let serial = serial
                 .as_str()
                 .ok_or(SimpleError::from("serialNumber not a string"))?;
-            if revocations.insert(Revocation {
+            if !revocations.insert(Revocation {
                 typ: RevocationType::IssuerSerial,
                 field1: issuer.to_owned(),
                 field2: serial.to_owned(),
             }) {
-                eprintln!("duplicate entry?");
+                eprintln!("duplicate entry in OneCRL?");
             }
         } else if entry.contains_key("subject") && entry.contains_key("pubKeyHash") {
             // TODO: I'm not actually sure about these field names, because there aren't any
@@ -225,7 +234,7 @@ fn download_current_revocations() -> Result<(), SimpleError> {
             let pub_key_hash = pub_key_hash
                 .as_str()
                 .ok_or(SimpleError::from("pubKeyHash not a string"))?;
-            if revocations.insert(Revocation {
+            if !revocations.insert(Revocation {
                 typ: RevocationType::IssuerSerial,
                 field1: subject.to_owned(),
                 field2: pub_key_hash.to_owned(),
@@ -236,6 +245,5 @@ fn download_current_revocations() -> Result<(), SimpleError> {
             eprintln!("entry with no issuer/serial or no subject/pubKeyHash");
         }
     }
-    println!("{:?}", revocations);
-    Ok(())
+    Ok(revocations)
 }
