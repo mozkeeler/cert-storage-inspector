@@ -1,4 +1,5 @@
 extern crate base64;
+extern crate byteorder;
 #[macro_use]
 extern crate clap;
 extern crate curl;
@@ -6,6 +7,7 @@ extern crate lmdb;
 extern crate rkv;
 extern crate serde_json;
 
+use byteorder::{NetworkEndian, ReadBytesExt};
 use clap::App;
 use curl::easy::Easy;
 use lmdb::EnvironmentFlags;
@@ -13,6 +15,7 @@ use rkv::{Rkv, StoreOptions, Value};
 use serde_json::Value as JsonValue;
 use std::collections::BTreeSet;
 use std::fmt::Display;
+use std::mem::size_of;
 use std::path::PathBuf;
 
 struct SimpleError {
@@ -27,6 +30,7 @@ impl<T: Display> From<T> for SimpleError {
     }
 }
 
+const CERT_SERIALIZATION_VERSION_1: u8 = 1;
 const DEFAULT_ONECRL_URL: &str = "https://firefox.settings.services.mozilla.com/v1/\
                                   buckets/security-state/collections/onecrl/records";
 
@@ -48,6 +52,7 @@ fn do_it(onecrl_url: &str, profile_path: &str) -> Result<(), SimpleError> {
     let revocations_in_profile = read_profile_revocations(profile_path)?;
     println!("revocations in profile: {}", revocations_in_profile.len());
     println!("revocations in OneCRL but not in profile:");
+    /*
     for revocation in current_revocations.difference(&revocations_in_profile) {
         println!("{:?}", revocation);
     }
@@ -55,7 +60,91 @@ fn do_it(onecrl_url: &str, profile_path: &str) -> Result<(), SimpleError> {
     for revocation in revocations_in_profile.difference(&current_revocations) {
         println!("{:?}", revocation);
     }
+    */
+    let _ = read_profile_certificates(profile_path)?;
     Ok(())
+}
+
+fn read_profile_certificates(profile_path: &str) -> Result<Vec<Cert>, SimpleError> {
+    let mut builder = Rkv::environment_builder();
+    builder.set_max_dbs(2);
+    builder.set_flags(EnvironmentFlags::READ_ONLY);
+    let mut db_path = PathBuf::from(profile_path);
+    db_path.push("security_state");
+    let env = Rkv::from_env(&db_path, builder)?;
+    let store = env.open_single("cert_storage", StoreOptions::default())?;
+    let reader = env.read()?;
+    let iter = store.iter_start(&reader)?;
+    for item in iter {
+        if let Ok((key, value)) = item {
+            maybe_decode_certificate(key, &value);
+        }
+    }
+    Ok(Vec::new())
+}
+
+fn maybe_decode_certificate(key: &[u8], value: &Option<Value>) {
+    if !has_prefix(key, PREFIX_CERT) {
+        return;
+    }
+    if let Some(Value::Blob(bytes)) = value {
+        if let Ok(cert) = Cert::from_bytes(bytes) {
+            println!("found cert of length {}", cert.der.len());
+        }
+    }
+}
+
+struct Cert {
+    der: Vec<u8>,
+    subject: Vec<u8>,
+    trust: i16,
+}
+
+impl Cert {
+    fn from_bytes(encoded: &[u8]) -> Result<Cert, SimpleError> {
+        if encoded.len() < size_of::<u8>() {
+            return Err(SimpleError::from("invalid Cert: no version?"));
+        }
+        let (mut version, rest) = encoded.split_at(size_of::<u8>());
+        let version = version.read_u8()?;
+        if version != CERT_SERIALIZATION_VERSION_1 {
+            return Err(SimpleError::from("invalid Cert: unexpected version"));
+        }
+
+        if rest.len() < size_of::<u16>() {
+            return Err(SimpleError::from("invalid Cert: no der len?"));
+        }
+        let (mut der_len, rest) = rest.split_at(size_of::<u16>());
+        let der_len = der_len.read_u16::<NetworkEndian>()? as usize;
+        if rest.len() < der_len {
+            return Err(SimpleError::from("invalid Cert: no der?"));
+        }
+        let (der, rest) = rest.split_at(der_len);
+
+        if rest.len() < size_of::<u16>() {
+            return Err(SimpleError::from("invalid Cert: no subject len?"));
+        }
+        let (mut subject_len, rest) = rest.split_at(size_of::<u16>());
+        let subject_len = subject_len.read_u16::<NetworkEndian>()? as usize;
+        if rest.len() < subject_len {
+            return Err(SimpleError::from("invalid Cert: no subject?"));
+        }
+        let (subject, mut rest) = rest.split_at(subject_len);
+
+        if rest.len() < size_of::<i16>() {
+            return Err(SimpleError::from("invalid Cert: no trust?"));
+        }
+        let trust = rest.read_i16::<NetworkEndian>()?;
+        if rest.len() > 0 {
+            return Err(SimpleError::from("invalid Cert: trailing data?"));
+        }
+
+        Ok(Cert {
+            der: der.to_owned(),
+            subject: subject.to_owned(),
+            trust,
+        })
+    }
 }
 
 fn read_profile_revocations(profile_path: &str) -> Result<BTreeSet<Revocation>, SimpleError> {
@@ -85,6 +174,7 @@ enum RevocationType {
 
 const PREFIX_REV_IS: &[u8] = b"is";
 const PREFIX_REV_SPK: &[u8] = b"spk";
+const PREFIX_CERT: &[u8] = b"cert";
 
 fn has_prefix(data: &[u8], prefix: &[u8]) -> bool {
     if data.len() >= prefix.len() {

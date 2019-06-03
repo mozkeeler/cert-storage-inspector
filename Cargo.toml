@@ -6,6 +6,7 @@ edition = "2018"
 
 [dependencies]
 base64 = "0.10"
+byteorder = "1.2.7"
 clap = {version = "2.33", features = ["yaml"]}
 curl = "^0.4"
 lmdb-rkv = "0.11"
