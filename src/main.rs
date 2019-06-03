@@ -6,6 +6,7 @@ extern crate curl;
 extern crate lmdb;
 extern crate rkv;
 extern crate serde_json;
+extern crate sha2;
 
 use byteorder::{NetworkEndian, ReadBytesExt};
 use clap::App;
@@ -13,6 +14,7 @@ use curl::easy::Easy;
 use lmdb::EnvironmentFlags;
 use rkv::{Rkv, StoreOptions, Value};
 use serde_json::Value as JsonValue;
+use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::fmt::Display;
 use std::mem::size_of;
@@ -33,25 +35,28 @@ impl<T: Display> From<T> for SimpleError {
 const CERT_SERIALIZATION_VERSION_1: u8 = 1;
 const DEFAULT_ONECRL_URL: &str = "https://firefox.settings.services.mozilla.com/v1/\
                                   buckets/security-state/collections/onecrl/records";
+const DEFAULT_CRLITE_URL: &str = "https://settings.stage.mozaws.net/v1/\
+                                  buckets/security-state/collections/intermediates/records";
 
 fn main() {
     let yaml = load_yaml!("cli.yml");
     let matches = App::from_yaml(yaml).get_matches();
     let onecrl_url = matches.value_of("onecrl-url").unwrap_or(DEFAULT_ONECRL_URL);
+    let crlite_url = matches.value_of("crlite-url").unwrap_or(DEFAULT_CRLITE_URL);
     let profile_path = matches
         .value_of("profile-path")
         .expect("need path to Firefox profile");
-    if let Err(e) = do_it(onecrl_url, profile_path) {
+    if let Err(e) = do_it(onecrl_url, crlite_url, profile_path) {
         eprintln!("{}", e.message);
     }
 }
 
-fn do_it(onecrl_url: &str, profile_path: &str) -> Result<(), SimpleError> {
-    let current_revocations = download_current_revocations(onecrl_url)?;
-    println!("current OneCRL revocations: {}", current_revocations.len());
-    let revocations_in_profile = read_profile_revocations(profile_path)?;
-    println!("revocations in profile: {}", revocations_in_profile.len());
-    println!("revocations in OneCRL but not in profile:");
+fn do_it(onecrl_url: &str, crlite_url: &str, profile_path: &str) -> Result<(), SimpleError> {
+    //let current_revocations = download_current_revocations(onecrl_url)?;
+    //println!("current OneCRL revocations: {}", current_revocations.len());
+    //let revocations_in_profile = read_profile_revocations(profile_path)?;
+    //println!("revocations in profile: {}", revocations_in_profile.len());
+    //println!("revocations in OneCRL but not in profile:");
     /*
     for revocation in current_revocations.difference(&revocations_in_profile) {
         println!("{:?}", revocation);
@@ -61,8 +66,96 @@ fn do_it(onecrl_url: &str, profile_path: &str) -> Result<(), SimpleError> {
         println!("{:?}", revocation);
     }
     */
-    let _ = read_profile_certificates(profile_path)?;
+    let preloaded_certs = download_current_certificates(crlite_url)?;
+    let certs = read_profile_certificates(profile_path)?;
+    let mut certs_for_comparison = BTreeSet::new();
+    for cert in certs {
+        let cert_for_comparison = PreloadedCert::from(&cert);
+        if certs_for_comparison.contains(&cert_for_comparison) {
+            eprintln!("duplicate preloaded certificate in profile?");
+        }
+        certs_for_comparison.insert(cert_for_comparison);
+    }
+    println!("preloaded certificates in CRLite but not profile:");
+    for cert in preloaded_certs.difference(&certs_for_comparison) {
+        println!("{}", base64::encode(&cert.subject));
+    }
+    println!("preloaded certificates in profile but not CRLite:");
+    for cert in certs_for_comparison.difference(&preloaded_certs) {
+        println!("{}", base64::encode(&cert.subject));
+    }
     Ok(())
+}
+
+fn download_current_certificates(
+    cert_preloads_url: &str,
+) -> Result<BTreeSet<PreloadedCert>, SimpleError> {
+    // TODO: this prerlude bit can be refactored
+    let mut easy = Easy::new();
+    easy.url(cert_preloads_url)?;
+    let mut data = Vec::new();
+    {
+        let mut transfer = easy.transfer();
+        transfer.write_function(|new_data| {
+            data.extend_from_slice(new_data);
+            Ok(new_data.len())
+        })?;
+        transfer.perform()?;
+    }
+    let records: JsonValue = serde_json::from_slice(&data)?;
+    let records = records
+        .as_object()
+        .ok_or(SimpleError::from("unexpected type"))?;
+    let data = records
+        .get("data")
+        .ok_or(SimpleError::from("missing data key"))?;
+    let data = data
+        .as_array()
+        .ok_or(SimpleError::from("unexpected type"))?;
+    let mut preloaded_certs = BTreeSet::new();
+    for entry in data {
+        let entry = entry
+            .as_object()
+            .ok_or(SimpleError::from("unexpected type"))?;
+        let der_hash = entry.get("derHash").ok_or(SimpleError::from(format!(
+            "couldn't get derHash: {:?}",
+            entry
+        )))?;
+        let der_hash = der_hash
+            .as_str()
+            .ok_or(SimpleError::from("derHash not a string"))?;
+        let subject_dn = entry.get("subjectDN").ok_or(SimpleError::from(format!(
+            "couldn't get subjectDN: {:?}",
+            entry
+        )))?;
+        let subject_dn = subject_dn
+            .as_str()
+            .ok_or(SimpleError::from("subjectDN not string"))?;
+        let preloaded_cert = PreloadedCert {
+            der_hash: base64::decode_config(der_hash, base64::URL_SAFE)?,
+            subject: base64::decode_config(subject_dn, base64::URL_SAFE)?,
+        };
+        if preloaded_certs.contains(&preloaded_cert) {
+            eprintln!("duplicate preloaded certificate in CRLite?");
+        }
+        preloaded_certs.insert(preloaded_cert);
+    }
+    Ok(preloaded_certs)
+}
+
+#[derive(Ord, Eq, PartialOrd, PartialEq, Debug)]
+struct PreloadedCert {
+    der_hash: Vec<u8>,
+    subject: Vec<u8>,
+}
+
+impl PreloadedCert {
+    fn from(cert: &Cert) -> PreloadedCert {
+        PreloadedCert {
+            der_hash: Sha256::digest(&cert.der).to_vec(),
+            subject: cert.subject.clone(),
+        }
+    }
 }
 
 fn read_profile_certificates(profile_path: &str) -> Result<Vec<Cert>, SimpleError> {
@@ -75,21 +168,22 @@ fn read_profile_certificates(profile_path: &str) -> Result<Vec<Cert>, SimpleErro
     let store = env.open_single("cert_storage", StoreOptions::default())?;
     let reader = env.read()?;
     let iter = store.iter_start(&reader)?;
+    let mut certs = Vec::new();
     for item in iter {
         if let Ok((key, value)) = item {
-            maybe_decode_certificate(key, &value);
+            maybe_decode_certificate(key, &value, &mut certs);
         }
     }
-    Ok(Vec::new())
+    Ok(certs)
 }
 
-fn maybe_decode_certificate(key: &[u8], value: &Option<Value>) {
+fn maybe_decode_certificate(key: &[u8], value: &Option<Value>, certs: &mut Vec<Cert>) {
     if !has_prefix(key, PREFIX_CERT) {
         return;
     }
     if let Some(Value::Blob(bytes)) = value {
         if let Ok(cert) = Cert::from_bytes(bytes) {
-            println!("found cert of length {}", cert.der.len());
+            certs.push(cert);
         }
     }
 }

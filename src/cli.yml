@@ -3,8 +3,14 @@ args:
     - onecrl-endpoint:
         short: o
         long: onecrl-endpoint
-        value_name: URL
+        value_name: ONECRL_URL
         help: URL of OneCRL endpoint
+        takes_value: true
+    - crlite-endoint:
+        short: c
+        long: crlite-endpoint
+        value_name: CRLITE_URL
+        help: URL of CRLite endpoint
         takes_value: true
     - profile-path:
         short: p
