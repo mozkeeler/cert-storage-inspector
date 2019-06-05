@@ -66,24 +66,34 @@ fn do_it(onecrl_url: &str, crlite_url: &str, profile_path: &str) -> Result<(), S
         println!("{:?}", revocation);
     }
     */
-    let preloaded_certs = download_current_certificates(crlite_url)?;
-    let certs = read_profile_certificates(profile_path)?;
-    let mut certs_for_comparison = BTreeSet::new();
-    for cert in certs {
+    let crlite_certs = download_current_certificates(crlite_url)?;
+    let profile_certs_list = read_profile_certificates(profile_path)?;
+    let mut profile_certs = BTreeSet::new();
+    for cert in profile_certs_list {
         let cert_for_comparison = PreloadedCert::from(&cert);
-        if certs_for_comparison.contains(&cert_for_comparison) {
+        if profile_certs.contains(&cert_for_comparison) {
             eprintln!("duplicate preloaded certificate in profile?");
         }
-        certs_for_comparison.insert(cert_for_comparison);
+        profile_certs.insert(cert_for_comparison);
+        validate_cert(profile_path, &cert)?;
     }
+    let certs_not_in_profile = crlite_certs.difference(&profile_certs);
+    println!(
+        "{} certs in CRLite but not profile",
+        certs_not_in_profile.count()
+    );
+    /*
     println!("preloaded certificates in CRLite but not profile:");
-    for cert in preloaded_certs.difference(&certs_for_comparison) {
+    for cert in  certs_not_in_profile {
         println!("{}", base64::encode(&cert.subject));
     }
+    */
+    /*
     println!("preloaded certificates in profile but not CRLite:");
-    for cert in certs_for_comparison.difference(&preloaded_certs) {
+    for cert in certs_for_comparison.difference(&crlite_certs) {
         println!("{}", base64::encode(&cert.subject));
     }
+    */
     Ok(())
 }
 
@@ -183,6 +193,10 @@ fn maybe_decode_certificate(key: &[u8], value: &Option<Value>, certs: &mut Vec<C
     }
     if let Some(Value::Blob(bytes)) = value {
         if let Ok(cert) = Cert::from_bytes(bytes) {
+            let cert_hash = Sha256::digest(&cert.der);
+            if &key[PREFIX_CERT.len()..] != cert_hash.as_slice() {
+                eprintln!("cert identified by key does not match hash"); // TODO
+            }
             certs.push(cert);
         }
     }
@@ -241,6 +255,49 @@ impl Cert {
     }
 }
 
+fn make_key(prefix: &[u8], bytes: &[u8]) -> Vec<u8> {
+    let mut key = prefix.to_owned();
+    key.extend_from_slice(bytes);
+    key
+}
+
+fn validate_cert(profile_path: &str, cert: &Cert) -> Result<(), SimpleError> {
+    // TODO: a lot of this can be refactored...
+    let mut builder = Rkv::environment_builder();
+    builder.set_max_dbs(2);
+    builder.set_flags(EnvironmentFlags::READ_ONLY);
+    let mut db_path = PathBuf::from(profile_path);
+    db_path.push("security_state");
+    let env = Rkv::from_env(&db_path, builder)?;
+    let store = env.open_single("cert_storage", StoreOptions::default())?;
+    let reader = env.read()?;
+    let subject_key = make_key(PREFIX_SUBJECT, &cert.subject);
+    let hash_list = match store.get(&reader, subject_key)? {
+        Some(Value::Blob(b)) => b.to_owned(),
+        Some(_) => {
+            return Err(SimpleError::from(
+                "unexpected value when looking up subject",
+            ))
+        }
+        None => return Err(SimpleError::from("no value when looking up subject")),
+    };
+    if hash_list.len() % Sha256::output_size() != 0 {
+        return Err(SimpleError::from("unexpected hash list size"));
+    }
+    let cert_hash = Sha256::digest(&cert.der);
+    let mut found = false;
+    for hash in hash_list.chunks_exact(Sha256::output_size()) {
+        if hash == cert_hash.as_slice() {
+            found = true;
+        }
+    }
+    if !found {
+        return Err(SimpleError::from("cert hash not in hash list"));
+    }
+    // TODO: lookup trust?
+    Ok(())
+}
+
 fn read_profile_revocations(profile_path: &str) -> Result<BTreeSet<Revocation>, SimpleError> {
     let mut builder = Rkv::environment_builder();
     builder.set_max_dbs(2);
@@ -269,6 +326,7 @@ enum RevocationType {
 const PREFIX_REV_IS: &[u8] = b"is";
 const PREFIX_REV_SPK: &[u8] = b"spk";
 const PREFIX_CERT: &[u8] = b"cert";
+const PREFIX_SUBJECT: &[u8] = b"subject";
 
 fn has_prefix(data: &[u8], prefix: &[u8]) -> bool {
     if data.len() >= prefix.len() {
