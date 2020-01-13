@@ -2,18 +2,19 @@ extern crate base64;
 #[macro_use]
 extern crate clap;
 extern crate curl;
-extern crate lmdb;
 extern crate rkv;
 extern crate serde_json;
 
 use clap::App;
 use curl::easy::Easy;
-use lmdb::EnvironmentFlags;
-use rkv::{Rkv, StoreOptions, Value};
+use rkv::backend::{BackendEnvironmentBuilder, SafeMode, SafeModeEnvironment};
+use rkv::{StoreOptions, Value};
 use serde_json::Value as JsonValue;
 use std::collections::BTreeSet;
 use std::fmt::Display;
 use std::path::PathBuf;
+
+type Rkv = rkv::Rkv<SafeModeEnvironment>;
 
 struct SimpleError {
     message: String,
@@ -59,12 +60,12 @@ fn do_it(onecrl_url: &str, profile_path: &str) -> Result<(), SimpleError> {
 }
 
 fn read_profile_revocations(profile_path: &str) -> Result<BTreeSet<Revocation>, SimpleError> {
-    let mut builder = Rkv::environment_builder();
+    let mut builder = Rkv::environment_builder::<SafeMode>();
     builder.set_max_dbs(2);
-    builder.set_flags(EnvironmentFlags::READ_ONLY);
+    builder.set_map_size(16777216); // 16MB
     let mut db_path = PathBuf::from(profile_path);
     db_path.push("security_state");
-    let env = Rkv::from_env(&db_path, builder)?;
+    let env = Rkv::from_builder(&db_path, builder)?;
     let store = env.open_single("cert_storage", StoreOptions::default())?;
     let reader = env.read()?;
     let iter = store.iter_start(&reader)?;
